@@ -1,26 +1,38 @@
+import "dotenv/config";
 import express from "express";
 import { prisma } from "./prismaClient";
+import {
+  clerkClient,
+  clerkMiddleware,
+  getAuth,
+  requireAuth,
+} from "@clerk/express";
+import { AuthObject } from "@clerk/express";
+import cors from "cors";
+import { error } from "console";
 
 const app = express();
 app.use(express.json());
 const port = 5000;
+app.use(
+  cors({
+    origin: "http://localhost:3000",
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
-// create
-app.post("/user", async (req, res) => {
-  try {
-    const { id, username, email } = req.body;
+app.use(clerkMiddleware());
 
-    const user = await prisma.user.create({
-      data: {
-        id,
-        username,
-        email,
-      },
-    });
-    res.json(user);
-  } catch (error) {
-    res.status(500).json({ error: "Failed to create user" });
+app.get("/protected", requireAuth(), async (req, res) => {
+  const { userId } = getAuth(req);
+  if (!userId) {
+    return res.status(401).json({ error: "Unauthorized" });
   }
+
+  const user = await clerkClient.users.getUser(userId);
+  return res.json({ user });
 });
 
 // read
@@ -34,51 +46,54 @@ app.get("/users", async (req, res) => {
   }
 });
 
-// update
-app.put("/users/:id", async (req, res) => {
+async function syncUserFromClerk(userId) {
   try {
-    const { id } = req.params;
-    const { username, email } = req.body;
-
-    const updatedUser = await prisma.user.update({
-      where: { id },
-      data: {
-        username,
-        email,
-      },
+    let dbUser = await prisma.user.findUnique({
+      where: { id: userId },
     });
-    res.json(updatedUser);
+    if (!dbUser) {
+      const clerkUser = await clerkClient.users.getUser(userId);
+      dbUser = await prisma.user.create({
+        data: {
+          id: userId,
+          email: clerkUser.emailAddresses[0]?.emailAddress || null,
+          username: clerkUser.username || null,
+        },
+      });
+      console.log("User synced from clerk", dbUser);
+    }
+    return dbUser;
   } catch (error) {
-    res.status(500).json({ error: "Failed to update user" });
+    console.error("User sync error", error);
+    throw error;
   }
-});
-
-// delete
-app.delete("/users/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const deletedUser = await prisma.user.delete({
-      where: { id },
-    });
-
-    res.json({ message: "user deleted successfully", deletedUser });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to delete user" });
-  }
-});
+}
 
 // message
 
 // create
-app.post("/message", async (req, res) => {
+
+app.post("/message", requireAuth(), async (req, res) => {
   try {
-    const { content, userId } = req.body;
+    const { userId } = getAuth(req);
+    const { content } = req.body;
+
+    if (!userId || !content) {
+      return res.status(401).json({ error: "Missing required fields" });
+    }
+
+    await syncUserFromClerk(userId);
+
     const newMsg = await prisma.message.create({
       data: {
         userId,
         content,
       },
+      include: {
+        user: true,
+      },
     });
+
     res.json({ message: "Msg created successfully.", newMsg });
   } catch (error) {
     res.status(500).json({ error: "Failed to create msg" });
@@ -86,9 +101,23 @@ app.post("/message", async (req, res) => {
 });
 
 // get all msgs
-app.get("/messages", async (req, res) => {
+app.get("/messages", requireAuth(), async (req, res) => {
   try {
-    const allMsgs = await prisma.message.findMany();
+    const { userId } = getAuth(req);
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized no user exists" });
+    }
+
+    const allMsgs = await prisma.message.findMany({
+      where: { userId },
+      include: {
+        user: true,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
     res.json({ message: "All msgs are here", allMsgs });
   } catch (error) {
     res.status(500).json({ error: "FAiled to get all msgs" });
@@ -98,13 +127,30 @@ app.get("/messages", async (req, res) => {
 // update msg
 app.patch("/messages/:id", async (req, res) => {
   try {
+    const { userId } = getAuth(req);
     const { id } = req.params;
     const { content } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized no user exists" });
+    }
+
+    const existingMsg = await prisma.message.findFirst({
+      where: {
+        id: Number(id),
+        userId: userId,
+      },
+    });
+
+    if (!existingMsg) {
+      return res
+        .status(404)
+        .json({ error: "Message not found or unauthorized" });
+    }
     const updatedMsg = await prisma.message.update({
       where: { id: Number(id) },
-      data: {
-        content,
-      },
+      data: { content },
+      include: { user: true },
     });
     res.json({ message: "update the msg", updatedMsg });
   } catch (error) {
@@ -115,7 +161,25 @@ app.patch("/messages/:id", async (req, res) => {
 // delete msg
 app.delete("/messages/:id", async (req, res) => {
   try {
+    const { userId } = getAuth(req);
     const { id } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized no user exists" });
+    }
+
+    const existingMsg = await prisma.message.findFirst({
+      where: {
+        id: Number(id),
+        userId: userId,
+      },
+    });
+
+    if (!existingMsg) {
+      return res
+        .status(404)
+        .json({ error: "Message not found or unauthorized" });
+    }
 
     const deletedMsg = await prisma.message.delete({
       where: { id: Number(id) },
